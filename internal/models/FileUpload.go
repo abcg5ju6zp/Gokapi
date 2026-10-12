@@ -14,4 +14,8 @@ type UploadParameters struct {
 	Password            string
 	ExternalUrl         string
 	FileRequestId       string
+	// PreassignedFileId is used for file request uploads to reuse the file id that was
+	// stored on the reservation when the completion was claimed. This keeps completion
+	// idempotent if the storage or database response is uncertain.
+	PreassignedFileId string
 }

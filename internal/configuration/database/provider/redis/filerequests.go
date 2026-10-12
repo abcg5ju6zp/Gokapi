@@ -63,7 +63,11 @@ func (p DatabaseProvider) SaveFileRequest(request models.FileRequest) {
 	p.setHashMap(p.buildArgs(prefixFileRequests + request.Id).AddFlat(request))
 }
 
-// DeleteFileRequest deletes a file request with the given ID
+// DeleteFileRequest deletes a file request with the given ID and all its reservations
 func (p DatabaseProvider) DeleteFileRequest(request models.FileRequest) {
+	if request.Id == "" {
+		return
+	}
+	p.DeleteUploadReservationsForRequest(request.Id)
 	p.deleteKey(prefixFileRequests + request.Id)
 }

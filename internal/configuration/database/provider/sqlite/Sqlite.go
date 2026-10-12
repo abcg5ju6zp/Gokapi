@@ -22,7 +22,7 @@ type DatabaseProvider struct {
 }
 
 // DatabaseSchemeVersion contains the version number to be expected from the current database. If lower, an upgrade will be performed
-const DatabaseSchemeVersion = 15
+const DatabaseSchemeVersion = 16
 
 // New returns an instance
 func New(dbConfig models.DbConnection) (DatabaseProvider, error) {
@@ -113,6 +113,29 @@ func (p DatabaseProvider) Upgrade(currentDbVersion int) {
 	// < v2.2.5
 	if currentDbVersion < 15 {
 		p.DeleteAllSessions()
+	}
+	// < next release: add file request generations and persistent upload reservations
+	if currentDbVersion < 16 {
+		err := p.rawSqlite(`ALTER TABLE UploadRequests ADD COLUMN "Version" INTEGER NOT NULL DEFAULT 1;
+		CREATE TABLE "UploadReservations" (
+			"Uuid"	TEXT NOT NULL UNIQUE,
+			"FileRequestId"	TEXT NOT NULL,
+			"Version"	INTEGER NOT NULL,
+			"ApiKeyId"	TEXT NOT NULL,
+			"MaxSizeBytes"	INTEGER NOT NULL,
+			"Status"	INTEGER NOT NULL,
+			"Expiry"	INTEGER NOT NULL,
+			"Created"	INTEGER NOT NULL,
+			"Updated"	INTEGER NOT NULL,
+			"FileId"	TEXT NOT NULL DEFAULT '',
+			"FileName"	TEXT NOT NULL DEFAULT '',
+			"ContentType"	TEXT NOT NULL DEFAULT '',
+			"FileSize"	INTEGER NOT NULL DEFAULT 0,
+			"Sha1"	TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY("Uuid")
+		) WITHOUT ROWID;
+		CREATE INDEX "idx_reservations_request_status" ON "UploadReservations" ("FileRequestId", "Status");`)
+		helper.Check(err)
 	}
 }
 
@@ -259,8 +282,27 @@ func (p DatabaseProvider) createNewDatabase() error {
 			"creation"	INTEGER NOT NULL,
 			"apiKey"	TEXT NOT NULL UNIQUE,
 			"note"	TEXT NOT NULL,
+			"Version"	INTEGER NOT NULL DEFAULT 1,
 			PRIMARY KEY("id")
 		);
+		CREATE TABLE "UploadReservations" (
+			"Uuid"	TEXT NOT NULL UNIQUE,
+			"FileRequestId"	TEXT NOT NULL,
+			"Version"	INTEGER NOT NULL,
+			"ApiKeyId"	TEXT NOT NULL,
+			"MaxSizeBytes"	INTEGER NOT NULL,
+			"Status"	INTEGER NOT NULL,
+			"Expiry"	INTEGER NOT NULL,
+			"Created"	INTEGER NOT NULL,
+			"Updated"	INTEGER NOT NULL,
+			"FileId"	TEXT NOT NULL DEFAULT '',
+			"FileName"	TEXT NOT NULL DEFAULT '',
+			"ContentType"	TEXT NOT NULL DEFAULT '',
+			"FileSize"	INTEGER NOT NULL DEFAULT 0,
+			"Sha1"	TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY("Uuid")
+		) WITHOUT ROWID;
+		CREATE INDEX "idx_reservations_request_status" ON "UploadReservations" ("FileRequestId", "Status");
 		CREATE TABLE "Statistics" (
 				"id"	INTEGER NOT NULL,
 				"type"	INTEGER NOT NULL UNIQUE,

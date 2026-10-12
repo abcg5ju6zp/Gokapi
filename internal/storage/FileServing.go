@@ -29,6 +29,7 @@ import (
 	"github.com/forceu/gokapi/internal/logging/serverstats"
 	"github.com/forceu/gokapi/internal/models"
 	"github.com/forceu/gokapi/internal/storage/chunking"
+	"github.com/forceu/gokapi/internal/storage/chunking/chunkreservation"
 	"github.com/forceu/gokapi/internal/storage/filesystem"
 	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
 	"github.com/forceu/gokapi/internal/storage/processingstatus"
@@ -122,6 +123,44 @@ func NewFile(fileContent io.Reader, fileHeader *multipart.FileHeader, userId int
 	return file, nil
 }
 
+// RecoverFileUpload completes the metadata stage of a file request upload whose chunk
+// processing reported an error after the final object was already stored. It verifies
+// that the object exists and writes the file metadata (idempotently reusing the
+// preassigned file id), without creating a second object or file.
+func RecoverFileUpload(reservation models.UploadReservation, userId int, params models.UploadParameters) (models.File, bool) {
+	if reservation.Sha1 == "" || reservation.FileId == "" {
+		return models.File{}, false
+	}
+	header := chunking.FileHeader{
+		Filename:    reservation.FileName,
+		ContentType: reservation.ContentType,
+		Size:        reservation.FileSize,
+	}
+	params.PreassignedFileId = reservation.FileId
+	file := createNewMetaData(reservation.Sha1, header, userId, params)
+	if !FileExists(file, configuration.Get().DataDir) {
+		return models.File{}, false
+	}
+	copyEncryptionInfo(&file)
+	database.SaveMetaData(file)
+	return file, true
+}
+
+func init() {
+	chunkreservation.SetFileMetadataRecovery(func(reservation models.UploadReservation) (models.File, bool) {
+		request, ok := database.GetFileRequest(reservation.FileRequestId)
+		if !ok {
+			return models.File{}, false
+		}
+		params := models.UploadParameters{
+			FileRequestId:     reservation.FileRequestId,
+			UnlimitedDownload: true,
+			UnlimitedTime:     true,
+		}
+		return RecoverFileUpload(reservation, request.UserId, params)
+	})
+}
+
 // isAllowedFileSize returns true if the file is not greater than the allowed filesize
 func isAllowedFileSize(size int64) bool {
 	return size <= int64(configuration.Get().MaxFileSizeMB)*1024*1024
@@ -176,6 +215,11 @@ func NewFileFromChunk(chunkId string, fileHeader chunking.FileHeader, userId int
 		return models.File{}, err
 	}
 	metaData := createNewMetaData(hash, fileHeader, userId, uploadRequest)
+	if uploadRequest.FileRequestId != "" {
+		// Record the final object name on the reservation before the object is moved,
+		// so an uncertain storage/database response can be reconciled afterwards
+		chunkreservation.RecordHash(chunkId, metaData.SHA1)
+	}
 	fileExists := FileExists(metaData, configuration.Get().DataDir)
 	if fileExists {
 		fileExists = copyEncryptionInfo(&metaData)
@@ -297,8 +341,12 @@ func encryptChunkFile(file *os.File, metadata *models.File) (*os.File, error) {
 }
 
 func createNewMetaData(hash string, fileHeader chunking.FileHeader, userId int, params models.UploadParameters) models.File {
+	fileId := params.PreassignedFileId
+	if fileId == "" {
+		fileId = createNewId()
+	}
 	file := models.File{
-		Id:                 createNewId(),
+		Id:                 fileId,
 		Name:               fileHeader.Filename,
 		SHA1:               hash,
 		Size:               helper.ByteCountSI(fileHeader.Size),
@@ -812,6 +860,7 @@ func FileExists(file models.File, dataDir string) bool {
 // If the parameter periodic is true, this function is recursive and calls itself every hour.
 func CleanUp(periodic bool) {
 	downloadstatus.Clean()
+	chunkreservation.Cleanup()
 	timeNow := time.Now().Unix()
 	wasItemDeleted := false
 	for key, element := range database.GetAllMetadata() {

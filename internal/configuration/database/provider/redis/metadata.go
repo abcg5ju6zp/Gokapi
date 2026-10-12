@@ -80,10 +80,25 @@ func (p DatabaseProvider) SaveMetaData(file models.File) {
 	marshalledFile, err := marshalEncryptionInfo(file)
 	helper.Check(err)
 	p.setHashMap(p.buildArgs(prefixMetaData + file.Id).AddFlat(marshalledFile))
+	// Maintain the per-request used-file set that backs atomic slot reservation
+	if file.UploadRequestId != "" && file.PendingDeletion == 0 {
+		conn := p.pool.Get()
+		defer conn.Close()
+		_, _ = conn.Do("SADD", p.dbPrefix+prefixReservationUsedFiles+file.UploadRequestId, file.Id)
+	} else {
+		conn := p.pool.Get()
+		defer conn.Close()
+		_, _ = conn.Do("SREM", p.dbPrefix+prefixReservationUsedFiles+file.UploadRequestId, file.Id)
+	}
 }
 
 // DeleteMetaData deletes information about a file
 func (p DatabaseProvider) DeleteMetaData(id string) {
+	if file, ok := p.GetMetaDataById(id); ok && file.UploadRequestId != "" {
+		conn := p.pool.Get()
+		defer conn.Close()
+		_, _ = conn.Do("SREM", p.dbPrefix+prefixReservationUsedFiles+file.UploadRequestId, id)
+	}
 	p.deleteKey(prefixMetaData + id)
 }
 

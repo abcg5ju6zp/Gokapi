@@ -358,6 +358,48 @@ func DeleteFileRequest(request models.FileRequest) {
 	db.DeleteFileRequest(request)
 }
 
+// Upload reservation section
+
+// TryCreateUploadReservation atomically occupies a slot if the request still has room
+func TryCreateUploadReservation(reservation models.UploadReservation, maxFiles int) bool {
+	return db.TryCreateUploadReservation(reservation, maxFiles)
+}
+
+// GetUploadReservation returns the reservation for the given upload id or false
+func GetUploadReservation(uuid string) (models.UploadReservation, bool) {
+	return db.GetUploadReservation(uuid)
+}
+
+// GetAllUploadReservations returns all stored upload reservations
+func GetAllUploadReservations() []models.UploadReservation {
+	return db.GetAllUploadReservations()
+}
+
+// CountActiveUploadReservations returns the number of reservations that still occupy a slot
+func CountActiveUploadReservations(fileRequestId string) int {
+	return db.CountActiveUploadReservations(fileRequestId)
+}
+
+// SaveUploadReservation stores the given reservation unconditionally (used for recovery)
+func SaveUploadReservation(reservation models.UploadReservation) {
+	db.SaveUploadReservation(reservation)
+}
+
+// CompareAndSetReservationStatus atomically transitions a reservation status
+func CompareAndSetReservationStatus(uuid string, allowedFromStatuses []int, newStatus int, newExpiry int64, fileId string) bool {
+	return db.CompareAndSetReservationStatus(uuid, allowedFromStatuses, newStatus, newExpiry, fileId)
+}
+
+// DeleteUploadReservation deletes the reservation with the given upload id
+func DeleteUploadReservation(uuid string) {
+	db.DeleteUploadReservation(uuid)
+}
+
+// DeleteUploadReservationsForRequest deletes all reservations of the given file request
+func DeleteUploadReservationsForRequest(fileRequestId string) {
+	db.DeleteUploadReservationsForRequest(fileRequestId)
+}
+
 // Statistics
 
 // GetStatTraffic returns the total traffic from statistics

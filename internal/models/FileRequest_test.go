@@ -37,7 +37,7 @@ func TestFileRequest_PopulateAndHelpers(t *testing.T) {
 		MaxSize:  10,
 	}
 
-	fr.Populate(files, 8)
+	fr.Populate(files, 8, 0)
 	test.IsEqualInt(t, fr.UploadedFiles, 2)
 	test.IsEqualInt(t, fr.MaxFiles, 5)
 	test.IsEqualInt(t, fr.CombinedMaxSize, 8)

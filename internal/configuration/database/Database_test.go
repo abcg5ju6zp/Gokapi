@@ -369,6 +369,123 @@ func TestRunGarbageCollection(t *testing.T) {
 	runAllTypesNoOutput(t, func() { RunGarbageCollection() })
 }
 
+func TestUploadReservations(t *testing.T) {
+	const requestId = "reservationtest"
+	now := time.Now().Unix()
+	runAllTypesNoOutput(t, func() {
+		SaveFileRequest(models.FileRequest{
+			Id: requestId, Name: "reservation test", UserId: 1, MaxFiles: 2, MaxSize: 10,
+			CreationDate: now, ApiKey: "reservationkey", Version: 1,
+		})
+	})
+	newReservation := func(uuid string) models.UploadReservation {
+		return models.UploadReservation{
+			Uuid: uuid, FileRequestId: requestId, Version: 1, ApiKeyId: "reservationkey",
+			Status: models.ReservationStatusReserved, Expiry: now + 1000, Created: now, Updated: now,
+		}
+	}
+
+	runAllTypesCompareOutput(t, func() any {
+		return TryCreateUploadReservation(newReservation("res1"), 2)
+	}, true)
+	// duplicate uuid cannot be created
+	runAllTypesCompareOutput(t, func() any {
+		return TryCreateUploadReservation(newReservation("res1"), 2)
+	}, false)
+	// second slot available
+	runAllTypesCompareOutput(t, func() any {
+		return TryCreateUploadReservation(newReservation("res2"), 2)
+	}, true)
+	// third reservation exceeds the limit
+	runAllTypesCompareOutput(t, func() any {
+		return TryCreateUploadReservation(newReservation("res3"), 2)
+	}, false)
+	runAllTypesCompareOutput(t, func() any {
+		return CountActiveUploadReservations(requestId)
+	}, 2)
+	// a completed file consumes a slot as well
+	runAllTypesNoOutput(t, func() {
+		SaveMetaData(models.File{
+			Id: "resfile", Name: "resfile", UploadRequestId: requestId,
+			UnlimitedDownloads: true, UnlimitedTime: true,
+		})
+	})
+	runAllTypesCompareOutput(t, func() any {
+		return TryCreateUploadReservation(newReservation("res3"), 2)
+	}, false)
+	runAllTypesNoOutput(t, func() { DeleteMetaData("resfile") })
+
+	// read back
+	runAllTypesCompareOutput(t, func() any {
+		r, ok := GetUploadReservation("res1")
+		return []any{r.Uuid, r.FileRequestId, r.Version, r.ApiKeyId, ok}
+	}, []any{"res1", requestId, int64(1), "reservationkey", true})
+
+	// CAS: reserved -> uploading
+	runAllTypesCompareOutput(t, func() any {
+		return CompareAndSetReservationStatus("res1",
+			[]int{models.ReservationStatusReserved, models.ReservationStatusUploading},
+			models.ReservationStatusUploading, now+2000, "")
+	}, true)
+	// CAS from a non-matching status fails
+	runAllTypesCompareOutput(t, func() any {
+		return CompareAndSetReservationStatus("res1",
+			[]int{models.ReservationStatusReserved}, models.ReservationStatusFinishing, now+2000, "")
+	}, false)
+	// CAS with file id
+	runAllTypesCompareOutput(t, func() any {
+		return CompareAndSetReservationStatus("res1",
+			[]int{models.ReservationStatusUploading},
+			models.ReservationStatusFinishing, now+2000, "fileid1")
+	}, true)
+	runAllTypesCompareOutput(t, func() any {
+		r, ok := GetUploadReservation("res1")
+		return []any{r.Status, r.FileId, ok}
+	}, []any{models.ReservationStatusFinishing, "fileid1", true})
+	// completing removes the reservation from the active count
+	runAllTypesNoOutput(t, func() {
+		CompareAndSetReservationStatus("res1",
+			[]int{models.ReservationStatusFinishing},
+			models.ReservationStatusCompleted, now+3000, "fileid1")
+	})
+	runAllTypesCompareOutput(t, func() any {
+		return CountActiveUploadReservations(requestId)
+	}, 1)
+	// SaveUploadReservation upserts unconditionally and updates the active set
+	runAllTypesNoOutput(t, func() {
+		r2, _ := GetUploadReservation("res2")
+		r2.Status = models.ReservationStatusCancelled
+		SaveUploadReservation(r2)
+	})
+	runAllTypesCompareOutput(t, func() any {
+		return CountActiveUploadReservations(requestId)
+	}, 0)
+
+	// deleted reservations are gone
+	runAllTypesNoOutput(t, func() {
+		DeleteUploadReservation("res2")
+		DeleteUploadReservation("res1")
+	})
+	_, ok := GetUploadReservation("res1")
+	test.IsEqualBool(t, ok, false)
+
+	// request deletion removes all remaining reservations
+	runAllTypesNoOutput(t, func() {
+		TryCreateUploadReservation(newReservation("res4"), 0)
+	})
+	runAllTypesCompareOutput(t, func() any {
+		return CountActiveUploadReservations(requestId)
+	}, 1)
+	runAllTypesNoOutput(t, func() {
+		DeleteFileRequest(models.FileRequest{Id: requestId})
+	})
+	runAllTypesCompareOutput(t, func() any {
+		return CountActiveUploadReservations(requestId)
+	}, 0)
+	_, exists := GetFileRequest(requestId)
+	test.IsEqualBool(t, exists, false)
+}
+
 func TestClose(t *testing.T) {
 	runAllTypesNoOutput(t, func() { Close() })
 }

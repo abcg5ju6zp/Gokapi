@@ -1006,7 +1006,7 @@ func uploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	_, err := fileupload.ProcessNewChunk(w, r, false, "", maxUpload)
+	_, err := fileupload.ProcessNewChunk(w, r, false, "", "", maxUpload)
 	responseError(w, err)
 }
 

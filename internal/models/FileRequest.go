@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/storage/chunking/chunkreservation"
 )
 
 // FileRequest contains information about a file request
@@ -15,6 +14,7 @@ type FileRequest struct {
 	MaxFiles        int      `json:"maxfiles" redis:"maxfiles"`         // The maximum number of files allowed
 	MaxSize         int      `json:"maxsize" redis:"maxsize"`           // The maximum file size allowed in MB
 	Expiry          int64    `json:"expiry" redis:"expiry"`             // The expiry time of the file request
+	Version         int64    `json:"version" redis:"version"`           // The generation of the request, increased on edits and key rotation
 	CreationDate    int64    `json:"creationdate" redis:"creationdate"` // The timestamp of the file request creation
 	Name            string   `json:"name" redis:"name"`                 // The given name for the file request
 	ApiKey          string   `json:"apikey" redis:"apikey"`             // The API key related to the file request
@@ -28,8 +28,10 @@ type FileRequest struct {
 	Files           []File   `json:"-" redis:"-"`                       // Contains an array of the IDs of all uploaded files. Needs to be calculated with Populate()
 }
 
-// Populate inserts the number of uploaded files and the last upload date
-func (f *FileRequest) Populate(files map[string]File, maxServerSize int) {
+// Populate inserts the number of uploaded files and the last upload date.
+// reservedUploads is the number of active (not yet completed) upload reservations
+// retrieved from the persistent reservation store, so it is shared by all instances.
+func (f *FileRequest) Populate(files map[string]File, maxServerSize int, reservedUploads int) {
 	f.FileIdList = make([]string, 0)
 	f.Files = make([]File, 0)
 	for _, file := range files {
@@ -47,7 +49,14 @@ func (f *FileRequest) Populate(files map[string]File, maxServerSize int) {
 		f.CombinedMaxSize = maxServerSize
 	}
 	f.UploadedFiles = len(f.FileIdList)
-	f.ReservedUploads = chunkreservation.GetCount(f.Id)
+	f.ReservedUploads = reservedUploads
+}
+
+// BumpVersion increases the generation of the file request. Existing reservations
+// are bound to the previous generation and can therefore not write to the request
+// after it was edited or its API key was rotated.
+func (f *FileRequest) BumpVersion() {
+	f.Version++
 }
 
 // GetReadableDateLastUpdate returns the last update date as YYYY-MM-DD HH:MM:SS

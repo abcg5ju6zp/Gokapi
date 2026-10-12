@@ -8,6 +8,7 @@ import (
 	"github.com/forceu/gokapi/internal/helper"
 	"github.com/forceu/gokapi/internal/models"
 	"github.com/forceu/gokapi/internal/storage"
+	"github.com/forceu/gokapi/internal/storage/chunking/chunkreservation"
 )
 
 // New creates a new file request object. It is not stored yet,
@@ -17,6 +18,7 @@ func New(user models.User) models.FileRequest {
 		Id:           helper.GenerateRandomString(configuration.GetEnvironment().LengthId),
 		UserId:       user.Id,
 		CreationDate: time.Now().Unix(),
+		Version:      1,
 		Name:         "Unnamed file request",
 	}
 }
@@ -27,7 +29,8 @@ func Get(id string) (models.FileRequest, bool) {
 	if !ok {
 		return models.FileRequest{}, false
 	}
-	result.Populate(database.GetAllMetadata(), configuration.Get().MaxFileSizeMB)
+	result.Populate(database.GetAllMetadata(), configuration.Get().MaxFileSizeMB,
+		database.CountActiveUploadReservations(id))
 	return result, true
 }
 
@@ -40,16 +43,18 @@ func GetAll() []models.FileRequest {
 	allFiles := database.GetAllMetadata()
 	maxServerSize := configuration.Get().MaxFileSizeMB
 	for i, request := range result {
-		request.Populate(allFiles, maxServerSize)
+		request.Populate(allFiles, maxServerSize,
+			database.CountActiveUploadReservations(request.Id))
 		result[i] = request
 	}
 	return result
 }
 
-// Delete all files associated with a file request and the request itself
+// Delete all files associated with a file request, its open reservations and the request itself
 func Delete(request models.FileRequest) {
 	files := GetAllFiles(request)
 	storage.DeleteFiles(files, true)
+	chunkreservation.CancelAllForRequest(request.Id)
 	database.DeleteFileRequest(request)
 	database.DeleteApiKey(request.ApiKey)
 }

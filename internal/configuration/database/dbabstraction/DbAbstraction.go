@@ -109,6 +109,27 @@ type Database interface {
 	// DeleteFileRequest deletes a file request with the given ID
 	DeleteFileRequest(request models.FileRequest)
 
+	// TryCreateUploadReservation atomically creates a reservation if the file request still
+	// has a free slot according to maxFiles (0 = unlimited). It returns false if there is no
+	// slot left, so concurrent instances cannot reserve more slots than allowed.
+	TryCreateUploadReservation(reservation models.UploadReservation, maxFiles int) bool
+	// GetUploadReservation returns the reservation for the given upload/chunk uuid
+	GetUploadReservation(uuid string) (models.UploadReservation, bool)
+	// GetAllUploadReservations returns all stored upload reservations
+	GetAllUploadReservations() []models.UploadReservation
+	// CountActiveUploadReservations returns the number of reservations that still occupy a slot
+	CountActiveUploadReservations(fileRequestId string) int
+	// SaveUploadReservation stores the given reservation unconditionally (used for recovery)
+	SaveUploadReservation(reservation models.UploadReservation)
+	// CompareAndSetReservationStatus atomically transitions the reservation status if the current
+	// status is contained in allowedFromStatuses. Expiry is set to newExpiry and, if non-empty,
+	// the file id is updated. It returns false if no reservation exists or the status did not match.
+	CompareAndSetReservationStatus(uuid string, allowedFromStatuses []int, newStatus int, newExpiry int64, fileId string) bool
+	// DeleteUploadReservation deletes the reservation with the given uuid
+	DeleteUploadReservation(uuid string)
+	// DeleteUploadReservationsForRequest deletes all reservations associated with the file request
+	DeleteUploadReservationsForRequest(fileRequestId string)
+
 	// GetStatTraffic returns the total traffic from statistics
 	GetStatTraffic() uint64
 	// SaveStatTraffic stores the total traffic

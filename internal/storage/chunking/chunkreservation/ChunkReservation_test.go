@@ -1,306 +1,345 @@
 package chunkreservation
 
 import (
+	"os"
 	"testing"
-	"testing/synctest"
 	"time"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/storage/chunking"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
 )
 
-// resetStateBlockCleanup resets the package-level state between tests.
-func resetStateBlockCleanup() {
-	reservationMutex.Lock()
-	reservedChunks = make(map[string]map[string]reservation)
-	runGcOnce.Do(func() {
-		//prevent New from spawning the cleanup goroutine
+func TestMain(m *testing.M) {
+	testconfiguration.Create(false)
+	configuration.Load()
+	configuration.ConnectDatabase()
+	exitVal := m.Run()
+	testconfiguration.Delete()
+	os.Exit(exitVal)
+}
+
+func createTestRequest(t *testing.T, maxFiles int) models.FileRequest {
+	t.Helper()
+	request := models.FileRequest{
+		Id:           helper.GenerateRandomString(20),
+		UserId:       7,
+		MaxFiles:     maxFiles,
+		MaxSize:      100,
+		CreationDate: time.Now().Unix(),
+		Version:      1,
+		ApiKey:       helper.GenerateRandomString(30),
+		Name:         "test request",
+	}
+	database.SaveFileRequest(request)
+	t.Cleanup(func() {
+		CancelAllForRequest(request.Id)
+		database.DeleteFileRequest(request)
 	})
-	reservationMutex.Unlock()
+	return request
 }
 
-// TestNew_ReturnsNonEmptyUuid checks that New returns a non-empty uuid string.
-func TestNew_ReturnsNonEmptyUuid(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	if uuid == "" {
-		t.Error("expected non-empty uuid, got empty string")
-	}
+func TestNew_PersistsReservation(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 1024)
+	test.IsNil(t, err)
+	test.IsEqualInt(t, len(uuid), 32)
+	test.IsEqualInt(t, GetCount(request.Id), 1)
+
+	reservation, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, reservation.FileRequestId, request.Id)
+	test.IsEqualString(t, reservation.ApiKeyId, request.ApiKey)
+	test.IsEqualInt64(t, reservation.Version, 1)
+	test.IsEqualInt64(t, reservation.MaxSizeBytes, 1024)
+	test.IsEqualInt(t, reservation.Status, models.ReservationStatusReserved)
 }
 
-// TestNew_UuidLength checks that the generated uuid has the expected length (32 chars).
-func TestNew_UuidLength(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	if len(uuid) != 32 {
-		t.Errorf("expected uuid length 32, got %d", len(uuid))
-	}
+func TestNew_AtomicSlotLimit(t *testing.T) {
+	request := createTestRequest(t, 1)
+	_, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	_, err = New(request, request.ApiKey, 0)
+	test.IsEqualBool(t, err == ErrNoSlotLeft, true)
+	test.IsEqualInt(t, GetCount(request.Id), 1)
 }
 
-// TestNew_UniqueUuids checks that two calls produce different uuids.
-func TestNew_UniqueUuids(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid1 := New("file1")
-	uuid2 := New("file1")
-	if uuid1 == uuid2 {
-		t.Error("expected unique uuids, got identical values")
+func TestNew_UnlimitedFiles(t *testing.T) {
+	request := createTestRequest(t, 0)
+	for i := 0; i < 5; i++ {
+		_, err := New(request, request.ApiKey, 0)
+		test.IsNil(t, err)
 	}
+	test.IsEqualInt(t, GetCount(request.Id), 5)
 }
 
-// TestNew_StoresReservation checks that New stores the reservation in the map.
-func TestNew_StoresReservation(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	reservationMutex.RLock()
-	_, ok := reservedChunks["file1"][uuid]
-	reservationMutex.RUnlock()
-	if !ok {
-		t.Error("expected reservation to be stored in map")
-	}
+func TestNew_StaleRequestGenerationRejected(t *testing.T) {
+	request := createTestRequest(t, 5)
+	stale := request
+	stale.Version = 42
+	_, err := New(stale, request.ApiKey, 0)
+	test.IsNotNil(t, err)
+	test.IsEqualInt(t, GetCount(request.Id), 0)
 }
 
-// TestNew_ExpiryIsInFuture checks that the reservation expiry is in the future.
-func TestNew_ExpiryIsInFuture(t *testing.T) {
-	resetStateBlockCleanup()
-	now := time.Now().Unix()
-	uuid := New("file1")
-	reservationMutex.RLock()
-	expiry := reservedChunks["file1"][uuid].Expiry
-	reservationMutex.RUnlock()
-	if expiry <= now {
-		t.Errorf("expected expiry > %d, got %d", now, expiry)
-	}
+func TestReservation_SurvivesRestart(t *testing.T) {
+	request := createTestRequest(t, 3)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	// Reservations are read straight from the database, so a new process observes the same count
+	test.IsEqualInt(t, GetCount(request.Id), 1)
+	_, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
 }
 
-// TestNew_ExpiryMatchesConstant checks that the expiry is set to now + timeReservationWithoutUpload.
-func TestNew_ExpiryMatchesConstant(t *testing.T) {
-	resetStateBlockCleanup()
-	now := time.Now().Unix()
-	uuid := New("file1")
-	reservationMutex.RLock()
-	expiry := reservedChunks["file1"][uuid].Expiry
-	reservationMutex.RUnlock()
-	expected := now + timeReservationWithoutUpload
-	// Allow 1 second of slack for execution time.
-	if expiry < expected || expiry > expected+1 {
-		t.Errorf("expected expiry ~%d, got %d", expected, expiry)
-	}
+func TestMarkUploading(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 2048)
+	test.IsNil(t, err)
+
+	reservation, err := MarkUploading(request.Id, uuid, request.ApiKey)
+	test.IsNil(t, err)
+	test.IsEqualInt(t, reservation.Status, models.ReservationStatusUploading)
+	test.IsEqualInt64(t, reservation.MaxSizeBytes, 2048)
+	// deadline is extended close to the 23h upload deadline
+	test.IsEqualBool(t, reservation.Expiry > time.Now().Unix()+timeReservationWithUpload-10, true)
+	test.IsEqualInt(t, GetCount(request.Id), 1)
+
+	// idempotent while uploading
+	_, err = MarkUploading(request.Id, uuid, request.ApiKey)
+	test.IsNil(t, err)
+
+	// unknown uuid rejected
+	_, err = MarkUploading(request.Id, "does-not-exist", request.ApiKey)
+	test.IsNotNil(t, err)
+
+	// wrong api key rejected
+	_, err = MarkUploading(request.Id, uuid, "other-key")
+	test.IsEqualBool(t, err == ErrReservationKey, true)
+
+	// wrong file request rejected
+	_, err = MarkUploading("other-request", uuid, request.ApiKey)
+	test.IsNotNil(t, err)
 }
 
-// TestNew_UuidStoredOnReservation checks that the uuid field on the reservation matches the returned uuid.
-func TestNew_UuidStoredOnReservation(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	reservationMutex.RLock()
-	r := reservedChunks["file1"][uuid]
-	reservationMutex.RUnlock()
-	if r.Uuid != uuid {
-		t.Errorf("expected reservation uuid %q, got %q", uuid, r.Uuid)
-	}
+func TestMarkUploading_RequestEditedRejected(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	request.BumpVersion()
+	database.SaveFileRequest(request)
+	_, err = MarkUploading(request.Id, uuid, request.ApiKey)
+	test.IsEqualBool(t, err == ErrRequestVersion, true)
 }
 
-// TestNew_InitialisesMapForNewId checks that New creates the inner map for a new file id.
-func TestNew_InitialisesMapForNewId(t *testing.T) {
-	resetStateBlockCleanup()
-	New("newfile")
-	reservationMutex.RLock()
-	_, ok := reservedChunks["newfile"]
-	reservationMutex.RUnlock()
-	if !ok {
-		t.Error("expected inner map to be initialised for new file id")
-	}
+func TestMarkUploading_KeyRotatedRejected(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	request.ApiKey = "rotated-key"
+	database.SaveFileRequest(request)
+	_, err = MarkUploading(request.Id, uuid, "rotated-key")
+	test.IsEqualBool(t, err == ErrReservationKey || err == ErrRequestVersion, true)
 }
 
-// TestNew_MultipleIdsAreIndependent checks that reservations for different ids don't interfere.
-func TestNew_MultipleIdsAreIndependent(t *testing.T) {
-	resetStateBlockCleanup()
-	New("fileA")
-	New("fileB")
-	New("fileB")
-	if GetCount("fileA") != 1 {
-		t.Errorf("expected 1 reservation for fileA, got %d", GetCount("fileA"))
-	}
-	if GetCount("fileB") != 2 {
-		t.Errorf("expected 2 reservations for fileB, got %d", GetCount("fileB"))
-	}
-}
+func TestClaimAndComplete(t *testing.T) {
+	request := createTestRequest(t, 2)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	_, err = MarkUploading(request.Id, uuid, request.ApiKey)
+	test.IsNil(t, err)
 
-// TestGetCount_ReturnsZeroForUnknownId checks that GetCount returns 0 for an unknown file id.
-func TestGetCount_ReturnsZeroForUnknownId(t *testing.T) {
-	resetStateBlockCleanup()
-	if count := GetCount("unknown"); count != 0 {
-		t.Errorf("expected 0, got %d", count)
-	}
-}
-
-// TestGetCount_ReturnsCorrectCount checks that GetCount reflects the number of active reservations.
-func TestGetCount_ReturnsCorrectCount(t *testing.T) {
-	resetStateBlockCleanup()
-	New("file1")
-	New("file1")
-	New("file1")
-	if count := GetCount("file1"); count != 3 {
-		t.Errorf("expected 3, got %d", count)
-	}
-}
-
-// TestSetComplete_RemovesReservation checks that SetComplete deletes the reservation.
-func TestSetComplete_RemovesReservation(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	SetComplete("file1", uuid)
-	reservationMutex.RLock()
-	_, ok := reservedChunks["file1"][uuid]
-	reservationMutex.RUnlock()
-	if ok {
-		t.Error("expected reservation to be removed after SetComplete")
-	}
-}
-
-// TestSetComplete_DecreasesCount checks that GetCount decreases after SetComplete.
-func TestSetComplete_DecreasesCount(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	New("file1")
-	SetComplete("file1", uuid)
-	if count := GetCount("file1"); count != 1 {
-		t.Errorf("expected count 1 after SetComplete, got %d", count)
-	}
-}
-
-// TestSetComplete_UnknownIdDoesNotPanic checks that SetComplete is safe for unknown ids.
-func TestSetComplete_UnknownIdDoesNotPanic(t *testing.T) {
-	resetStateBlockCleanup()
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("SetComplete panicked on unknown id: %v", r)
-		}
-	}()
-	SetComplete("unknown-id", "unknown-uuid")
-}
-
-// TestSetUploading_ReturnsTrueForValidReservation checks the happy path.
-func TestSetUploading_ReturnsTrueForValidReservation(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := New("file1")
-	if !SetUploading("file1", uuid) {
-		t.Error("expected SetUploading to return true for a valid reservation")
-	}
-}
-
-// TestSetUploading_ExtendsExpiry checks that SetUploading extends the expiry to the upload constant.
-func TestSetUploading_ExtendsExpiry(t *testing.T) {
-	resetStateBlockCleanup()
-	now := time.Now().Unix()
-	uuid := New("file1")
-	SetUploading("file1", uuid)
-	reservationMutex.RLock()
-	expiry := reservedChunks["file1"][uuid].Expiry
-	reservationMutex.RUnlock()
-	expected := now + timeReservationWithUpload
-	if expiry < expected || expiry > expected+1 {
-		t.Errorf("expected expiry ~%d after SetUploading, got %d", expected, expiry)
-	}
-}
-
-// TestSetUploading_ReturnsFalseForUnknownId checks that SetUploading returns false for unknown file id.
-func TestSetUploading_ReturnsFalseForUnknownId(t *testing.T) {
-	resetStateBlockCleanup()
-	if SetUploading("unknown-id", "some-uuid") {
-		t.Error("expected SetUploading to return false for unknown file id")
-	}
-}
-
-// TestSetUploading_ReturnsFalseForUnknownUuid checks that SetUploading returns false for unknown uuid.
-func TestSetUploading_ReturnsFalseForUnknownUuid(t *testing.T) {
-	resetStateBlockCleanup()
-	New("file1")
-	if SetUploading("file1", "not-a-real-uuid") {
-		t.Error("expected SetUploading to return false for unknown uuid")
-	}
-}
-
-// TestSetUploading_ReturnsFalseForExpiredReservation checks that an expired reservation is rejected.
-func TestSetUploading_ReturnsFalseForExpiredReservation(t *testing.T) {
-	resetStateBlockCleanup()
-	uuid := "expired-uuid"
-	reservationMutex.Lock()
-	reservedChunks["file1"] = map[string]reservation{
-		uuid: {Uuid: uuid, Expiry: time.Now().Unix() - 1},
-	}
-	reservationMutex.Unlock()
-	if SetUploading("file1", uuid) {
-		t.Error("expected SetUploading to return false for expired reservation")
-	}
-}
-
-// TestCleanup_RemovesExpiredReservations checks that cleanUp removes expired entries.
-func TestCleanup_RemovesExpiredReservations(t *testing.T) {
-	resetStateBlockCleanup()
-	reservationMutex.Lock()
-	reservedChunks["file1"] = map[string]reservation{
-		"expired": {Uuid: "expired", Expiry: time.Now().Unix() - 10},
-		"valid":   {Uuid: "valid", Expiry: time.Now().Unix() + 300},
-	}
-	reservationMutex.Unlock()
-
-	cleanUp(false)
-
-	reservationMutex.RLock()
-	_, expiredExists := reservedChunks["file1"]["expired"]
-	_, validExists := reservedChunks["file1"]["valid"]
-	reservationMutex.RUnlock()
-
-	if expiredExists {
-		t.Error("expected expired reservation to be removed by cleanUp")
-	}
-	if !validExists {
-		t.Error("expected valid reservation to survive cleanUp")
-	}
-}
-
-// TestCleanup_EmptyMapDoesNotPanic checks that cleanUp on an empty map does not panic.
-func TestCleanup_EmptyMapDoesNotPanic(t *testing.T) {
-	resetStateBlockCleanup()
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("cleanUp panicked on empty map: %v", r)
-		}
-	}()
-	cleanUp(false)
-}
-
-// TestCleanup_PeriodicRunsAfterFiveMinutes verifies that the periodic cleanup goroutine
-// re-runs after 5 minutes. The fake clock advances instantly — no real waiting.
-func TestCleanup_PeriodicRunsAfterFiveMinutes(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		resetStateBlockCleanup()
-
-		// Insert a reservation that expires in 2 minutes.
-		reservationMutex.Lock()
-		reservedChunks["file1"] = map[string]reservation{
-			"will-expire": {Uuid: "will-expire", Expiry: time.Now().Unix() + 120},
-		}
-		reservationMutex.Unlock()
-
-		// Run one non-periodic pass; token still valid so it should survive.
-		cleanUp(false)
-		synctest.Wait()
-
-		reservationMutex.RLock()
-		_, stillThere := reservedChunks["file1"]["will-expire"]
-		reservationMutex.RUnlock()
-		if !stillThere {
-			t.Error("expected reservation to still be present before expiry")
-		}
-
-		// Advance fake clock past the 2-minute expiry and the 5-minute cleanup interval.
-		time.Sleep(6 * time.Minute)
-		cleanUp(false)
-		synctest.Wait()
-
-		reservationMutex.RLock()
-		_, stillThere = reservedChunks["file1"]["will-expire"]
-		reservationMutex.RUnlock()
-		if stillThere {
-			t.Error("expected reservation to be removed after periodic cleanup ran")
-		}
+	reservation, err := Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{
+		Filename: "test.upload", ContentType: "text/plain", Size: 13,
 	})
+	test.IsNil(t, err)
+	test.IsEqualInt(t, reservation.Status, models.ReservationStatusFinishing)
+	test.IsEqualBool(t, reservation.FileId != "", true)
+	test.IsEqualString(t, reservation.FileName, "test.upload")
+	test.IsEqualInt64(t, reservation.FileSize, 13)
+	test.IsEqualInt(t, GetCount(request.Id), 1)
+
+	// a second claim cannot finish the same reservation
+	_, err = Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{})
+	test.IsEqualBool(t, err == ErrAlreadyProcessing, true)
+
+	// simulate the confirmed file metadata
+	database.SaveMetaData(models.File{
+		Id: reservation.FileId, Name: "test.file", UploadRequestId: request.Id,
+		UnlimitedDownloads: true, UnlimitedTime: true, UserId: request.UserId,
+	})
+	ok := MarkCompleted(models.UploadReservation{Uuid: uuid, FileRequestId: request.Id, FileId: reservation.FileId})
+	test.IsEqualBool(t, ok, true)
+	// completed reservations do not occupy a slot anymore
+	test.IsEqualInt(t, GetCount(request.Id), 0)
+
+	// retry sees the already completed reservation
+	_, err = Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{})
+	test.IsEqualBool(t, err == ErrAlreadyCompleted, true)
+
+	// exactly once: second completion is a no-op
+	ok = MarkCompleted(models.UploadReservation{Uuid: uuid, FileRequestId: request.Id, FileId: reservation.FileId})
+	test.IsEqualBool(t, ok, false)
+
+	database.DeleteMetaData(reservation.FileId)
+}
+
+func TestResumeForRetry(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	reservation, err := Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{
+		Filename: "test.upload", Size: 13,
+	})
+	test.IsNil(t, err)
+	test.IsEqualBool(t, ResumeForRetry(uuid), true)
+	reopened, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt(t, reopened.Status, models.ReservationStatusUploading)
+	test.IsEqualString(t, reopened.FileId, reservation.FileId)
+	// only finishing reservations can be resumed
+	test.IsEqualBool(t, ResumeForRetry(uuid), false)
+}
+
+func TestCancel(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+
+	// another request cannot cancel it
+	test.IsEqualBool(t, Cancel("other-request", uuid, request.ApiKey, false), false)
+	test.IsEqualInt(t, GetCount(request.Id), 1)
+
+	// wrong key cannot cancel it
+	test.IsEqualBool(t, Cancel(request.Id, uuid, "other-key", false), false)
+
+	test.IsEqualBool(t, Cancel(request.Id, uuid, request.ApiKey, false), true)
+	test.IsEqualInt(t, GetCount(request.Id), 0)
+	// idempotent
+	test.IsEqualBool(t, Cancel(request.Id, uuid, request.ApiKey, false), true)
+}
+
+func TestCancel_RemovesChunk(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	chunkPath := configuration.Get().DataDir + "/chunk-" + uuid
+	test.IsNil(t, os.WriteFile(chunkPath, []byte("chunkdata"), 0600))
+	test.IsEqualBool(t, Cancel(request.Id, uuid, request.ApiKey, true), true)
+	_, err = os.Stat(chunkPath)
+	test.IsEqualBool(t, os.IsNotExist(err), true)
+}
+
+func TestCleanup_ExpiredReservationsReleased(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	chunkPath := configuration.Get().DataDir + "/chunk-" + uuid
+	test.IsNil(t, os.WriteFile(chunkPath, []byte("chunkdata"), 0600))
+
+	// force expiry
+	reservation, _ := Get(uuid)
+	reservation.Expiry = time.Now().Unix() - 1
+	database.SaveUploadReservation(reservation)
+
+	Cleanup()
+	_, ok := Get(uuid)
+	test.IsEqualBool(t, ok, false)
+	_, err = os.Stat(chunkPath)
+	test.IsEqualBool(t, os.IsNotExist(err), true)
+	test.IsEqualInt(t, GetCount(request.Id), 0)
+}
+
+func TestCleanup_ValidReservationsKept(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	Cleanup()
+	_, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
+}
+
+func TestCleanup_RequestDeletedReleases(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	database.DeleteFileRequest(request)
+	Cleanup()
+	_, ok := Get(uuid)
+	test.IsEqualBool(t, ok, false)
+}
+
+func TestCleanup_StuckFinishingReopened(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	chunkPath := configuration.Get().DataDir + "/chunk-" + uuid
+	test.IsNil(t, os.WriteFile(chunkPath, []byte("chunkdata"), 0600))
+
+	reservation, err := Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{})
+	test.IsNil(t, err)
+	// simulate a crash during finishing
+	reservation.Updated = time.Now().Unix() - finishingGrace - 10
+	database.SaveUploadReservation(reservation)
+
+	Cleanup()
+	reopened, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt(t, reopened.Status, models.ReservationStatusUploading)
+}
+
+func TestCleanup_StuckFinishingWithMetadataCompleted(t *testing.T) {
+	request := createTestRequest(t, 1)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	reservation, err := Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{})
+	test.IsNil(t, err)
+	database.SaveMetaData(models.File{
+		Id: reservation.FileId, Name: "test.file", UploadRequestId: request.Id,
+		UnlimitedDownloads: true, UnlimitedTime: true, UserId: request.UserId,
+	})
+	reservation.Updated = time.Now().Unix() - finishingGrace - 10
+	database.SaveUploadReservation(reservation)
+
+	Cleanup()
+	completed, ok := Get(uuid)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt(t, completed.Status, models.ReservationStatusCompleted)
+	// the confirmed file is preserved
+	_, fileExists := database.GetMetaDataById(reservation.FileId)
+	test.IsEqualBool(t, fileExists, true)
+	test.IsEqualInt(t, GetCount(request.Id), 0)
+	database.DeleteMetaData(reservation.FileId)
+}
+
+func TestCleanup_StuckFinishingWithoutChunkReleased(t *testing.T) {
+	request := createTestRequest(t, 5)
+	uuid, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	reservation, err := Claim(request.Id, uuid, request.ApiKey, chunking.FileHeader{})
+	test.IsNil(t, err)
+	reservation.Updated = time.Now().Unix() - finishingGrace - 10
+	database.SaveUploadReservation(reservation)
+
+	Cleanup()
+	_, ok := Get(uuid)
+	test.IsEqualBool(t, ok, false)
+}
+
+func TestCancelAllForRequest(t *testing.T) {
+	request := createTestRequest(t, 0)
+	uuid1, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	uuid2, err := New(request, request.ApiKey, 0)
+	test.IsNil(t, err)
+	CancelAllForRequest(request.Id)
+	test.IsEqualInt(t, GetCount(request.Id), 0)
+	_, ok := Get(uuid1)
+	test.IsEqualBool(t, ok, false)
+	_, ok = Get(uuid2)
+	test.IsEqualBool(t, ok, false)
 }

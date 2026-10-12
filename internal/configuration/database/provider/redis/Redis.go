@@ -21,7 +21,7 @@ type DatabaseProvider struct {
 }
 
 // DatabaseSchemeVersion contains the version number to be expected from the current database. If lower, an upgrade will be performed
-const DatabaseSchemeVersion = 8
+const DatabaseSchemeVersion = 9
 
 // New returns an instance
 func New(dbConfig models.DbConnection) (DatabaseProvider, error) {
@@ -161,6 +161,11 @@ func (p DatabaseProvider) Upgrade(currentDbVersion int) {
 	// < v2.2.5
 	if currentDbVersion < 8 {
 		p.DeleteAllSessions()
+	}
+	// < next release: persistent upload reservations are stored as hashes/sets,
+	// no structural migration is required as Redis keys are created on demand.
+	if currentDbVersion < 9 {
+		p.rebuildUsedFileSets()
 	}
 }
 

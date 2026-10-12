@@ -3,6 +3,7 @@
 package sqlite
 
 import (
+	"database/sql"
 	"math"
 	"os"
 	"slices"
@@ -695,4 +696,81 @@ func TestRawSql(t *testing.T) {
 	dbInstance.sqliteDb = nil
 	defer test.ExpectPanic(t)
 	_ = dbInstance.rawSqlite("Select * from Sessions")
+}
+
+// TestDatabaseProvider_UpgradeV15Reservations verifies that a v15 database gains the
+// request Version column and the UploadReservations table during the upgrade
+func TestDatabaseProvider_UpgradeV15Reservations(t *testing.T) {
+	oldDb, err := sql.Open("sqlite", "./test/gokapi_upgrade.sqlite?_pragma=busy_timeout=30000")
+	test.IsNil(t, err)
+	_, err = oldDb.Exec(`CREATE TABLE "UploadRequests" (
+		"id" TEXT NOT NULL UNIQUE,
+		"name" TEXT,
+		"userid" INTEGER NOT NULL,
+		"expiry" INTEGER NOT NULL,
+		"maxFiles" INTEGER NOT NULL,
+		"maxSize" INTEGER NOT NULL,
+		"creation" INTEGER NOT NULL,
+		"apiKey" TEXT NOT NULL UNIQUE,
+		"note" TEXT NOT NULL,
+		PRIMARY KEY("id"));
+		CREATE TABLE "FileMetaData" (
+		"Id" TEXT NOT NULL UNIQUE,
+		"Name" TEXT NOT NULL,
+		"Size" TEXT NOT NULL,
+		"SHA1" TEXT NOT NULL,
+		"ExpireAt" INTEGER NOT NULL,
+		"SizeBytes" INTEGER NOT NULL,
+		"DownloadsRemaining" INTEGER NOT NULL,
+		"DownloadCount" INTEGER NOT NULL,
+		"PasswordHash" TEXT NOT NULL,
+		"HotlinkId" TEXT NOT NULL,
+		"ContentType" TEXT NOT NULL,
+		"AwsBucket" TEXT NOT NULL,
+		"Encryption" BLOB NOT NULL,
+		"UnlimitedDownloads" INTEGER NOT NULL,
+		"UnlimitedTime" INTEGER NOT NULL,
+		"UserId" INTEGER NOT NULL,
+		"UploadDate" INTEGER NOT NULL,
+		"PendingDeletion" INTEGER NOT NULL,
+		"UploadRequestId" TEXT NOT NULL,
+		PRIMARY KEY("Id"));
+		PRAGMA user_version = 15;`)
+	test.IsNil(t, err)
+	_, err = oldDb.Exec(`INSERT INTO UploadRequests (id,name,userid,expiry,maxFiles,maxSize,creation,apiKey,note)
+		VALUES ('upgreq','old',1,0,2,10,1,'oldkey','')`)
+	test.IsNil(t, err)
+	test.IsNil(t, oldDb.Close())
+
+	instance, err := New(models.DbConnection{HostUrl: "./test/gokapi_upgrade.sqlite", Type: 0})
+	test.IsNil(t, err)
+	test.IsEqualInt(t, instance.GetDbVersion(), 15)
+
+	instance.Upgrade(15)
+	instance.SetDbVersion(DatabaseSchemeVersion)
+	test.IsEqualInt(t, instance.GetDbVersion(), DatabaseSchemeVersion)
+
+	// existing requests default to generation 1
+	request, ok := instance.GetFileRequest("upgreq")
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt64(t, request.Version, 1)
+
+	// the new reservation table works, including atomic slot checks
+	now := time.Now().Unix()
+	reservation := models.UploadReservation{
+		Uuid: "upgres", FileRequestId: "upgreq", Version: 1, ApiKeyId: "oldkey",
+		Status: models.ReservationStatusReserved, Expiry: now + 100, Created: now, Updated: now,
+	}
+	test.IsEqualBool(t, instance.TryCreateUploadReservation(reservation, 2), true)
+	test.IsEqualBool(t, instance.TryCreateUploadReservation(reservation, 2), false)
+	test.IsEqualInt(t, instance.CountActiveUploadReservations("upgreq"), 1)
+
+	request.BumpVersion()
+	instance.SaveFileRequest(request)
+	oldGeneration := reservation
+	oldGeneration.Uuid = "upgres2"
+	test.IsEqualBool(t, instance.TryCreateUploadReservation(oldGeneration, 2), false)
+
+	instance.Close()
+	test.IsNil(t, os.Remove("./test/gokapi_upgrade.sqlite"))
 }

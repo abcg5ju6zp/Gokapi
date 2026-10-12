@@ -375,13 +375,13 @@ func apiChunkAdd(w http.ResponseWriter, r requestParser, _ models.User, _ models
 	if !ok {
 		panic("invalid parameter passed")
 	}
-	statusCode, errCode, errString := processNewChunk(w, request, configuration.Get().MaxFileSizeMB, "")
+	statusCode, errCode, errString := processNewChunk(w, request, configuration.Get().MaxFileSizeMB, "", "")
 	if statusCode != http.StatusOK {
 		sendError(w, statusCode, errCode, errString)
 	}
 }
 
-func apiChunkReserve(w http.ResponseWriter, r requestParser, _ models.User, apikey models.ApiKey) {
+func apiChunkReserve(w http.ResponseWriter, r requestParser, user models.User, apikey models.ApiKey) {
 	request, ok := r.(*paramChunkReserve)
 	if !ok {
 		panic("invalid parameter passed")
@@ -399,13 +399,32 @@ func apiChunkReserve(w http.ResponseWriter, r requestParser, _ models.User, apik
 		sendError(w, http.StatusTooManyRequests, errorcodes.RateLimited, "Too many reservations for this file request. Please wait a few seconds before reserving a new uuid.")
 		return
 	}
-	uuid := chunkreservation.New(fileRequest.Id)
+	uuid, err := chunkreservation.New(fileRequest, apikey.Id, maxFileRequestUploadBytes(fileRequest, user))
+	if err != nil {
+		sendError(w, http.StatusBadRequest, errorcodes.CannotUploadMoreFiles, err.Error())
+		return
+	}
 	result, err := json.Marshal(struct {
 		Result string `json:"Result"`
 		Uuid   string `json:"Uuid"`
 	}{"OK", uuid})
 	helper.Check(err)
 	_, _ = w.Write(result)
+}
+
+// maxFileRequestUploadBytes returns the effective per-file size limit snapshot for a reservation
+func maxFileRequestUploadBytes(fileRequest models.FileRequest, user models.User) int64 {
+	if fileRequest.IsUnlimitedSize() {
+		return 0
+	}
+	maxUpload := int64(fileRequest.MaxSize) * 1024 * 1024
+	serverMax := int64(configuration.Get().MaxFileSizeMB) * 1024 * 1024
+	maxUpload = min(maxUpload, serverMax)
+	if !user.IsAdmin() && configuration.GetEnvironment().MaxSizeGuestUploadMb != 0 {
+		guestMax := int64(configuration.GetEnvironment().MaxSizeGuestUploadMb) * 1024 * 1024
+		maxUpload = min(maxUpload, guestMax)
+	}
+	return maxUpload
 }
 
 func apiChunkUnreserve(w http.ResponseWriter, r requestParser, _ models.User, apikey models.ApiKey) {
@@ -418,8 +437,7 @@ func apiChunkUnreserve(w http.ResponseWriter, r requestParser, _ models.User, ap
 		sendError(w, status, errorCode, errorMsg)
 		return
 	}
-	chunkreservation.SetComplete(fileRequest.Id, request.Uuid)
-	_ = chunking.DeleteChunk(request.Uuid)
+	chunkreservation.Cancel(fileRequest.Id, request.Uuid, apikey.Id, true)
 	_, _ = w.Write([]byte(`{"Result":"OK"}`))
 }
 
@@ -440,13 +458,27 @@ func apiChunkUploadRequestAdd(w http.ResponseWriter, r requestParser, user model
 	if !fileRequest.IsUnlimitedSize() {
 		maxUpload = min(maxUpload, fileRequest.MaxSize)
 	}
-	statusCode, errorCode, errString := processNewChunk(w, request, maxUpload, fileRequest.Id)
+	statusCode, errorCode, errString := processNewChunk(w, request, maxUpload, fileRequest.Id, apikey.Id)
 	if statusCode != http.StatusOK {
 		sendError(w, statusCode, errorCode, errString)
 	}
 }
 
 func checkFileRequestAndApiKey(fileRequestId string, apiKey models.ApiKey) (models.FileRequest, bool, int, int, string) {
+	fileRequest, ok, status, errorCode, msg := checkFileRequestForCompletion(fileRequestId, apiKey)
+	if !ok {
+		return models.FileRequest{}, false, status, errorCode, msg
+	}
+	if !fileRequest.IsUnlimitedFiles() && fileRequest.UploadedFiles >= fileRequest.MaxFiles {
+		return models.FileRequest{}, false, http.StatusUnauthorized, errorcodes.CannotUploadMoreFiles,
+			"Max file count has already been reached for this filerequest"
+	}
+	return fileRequest, true, 0, 0, ""
+}
+
+// checkFileRequestForCompletion validates existence, API key and expiry, but not the
+// remaining file count, so idempotent completions survive a reached file limit
+func checkFileRequestForCompletion(fileRequestId string, apiKey models.ApiKey) (models.FileRequest, bool, int, int, string) {
 	fileRequest, ok := filerequest.Get(fileRequestId)
 	if !ok {
 		return models.FileRequest{}, false, http.StatusNotFound, errorcodes.NotFound, "FileRequest does not exist with the given ID"
@@ -457,9 +489,6 @@ func checkFileRequestAndApiKey(fileRequestId string, apiKey models.ApiKey) (mode
 	if !fileRequest.IsUnlimitedTime() && fileRequest.Expiry < time.Now().Unix() {
 		return models.FileRequest{}, false, http.StatusUnauthorized, errorcodes.RequestExpired, "Filerequest has expired"
 	}
-	if !fileRequest.IsUnlimitedFiles() && fileRequest.UploadedFiles >= fileRequest.MaxFiles {
-		return models.FileRequest{}, false, http.StatusUnauthorized, errorcodes.CannotUploadMoreFiles, "Max file count has already been reached for this file request"
-	}
 	return fileRequest, true, 0, 0, ""
 }
 
@@ -467,13 +496,13 @@ type chunkParams interface {
 	GetRequest() *http.Request
 }
 
-func processNewChunk(w http.ResponseWriter, request chunkParams, maxFileSizeMb int, filerequestId string) (int, int, string) {
+func processNewChunk(w http.ResponseWriter, request chunkParams, maxFileSizeMb int, filerequestId, filerequestApiKey string) (int, int, string) {
 	maxUpload := int64(maxFileSizeMb) * 1024 * 1024
 	if request.GetRequest().ContentLength > maxUpload {
 		return http.StatusBadRequest, errorcodes.FileTooLarge, storage.ErrorFileTooLarge.Error()
 	}
 	request.GetRequest().Body = http.MaxBytesReader(w, request.GetRequest().Body, maxUpload)
-	errCode, err := fileupload.ProcessNewChunk(w, request.GetRequest(), true, filerequestId, maxUpload)
+	errCode, err := fileupload.ProcessNewChunk(w, request.GetRequest(), true, filerequestId, filerequestApiKey, maxUpload)
 	if err != nil {
 		return http.StatusBadRequest, errCode, err.Error()
 	}
@@ -494,26 +523,82 @@ func apiChunkComplete(w http.ResponseWriter, r requestParser, user models.User, 
 		request.FileSize,
 		"")
 	if request.IsNonBlocking {
-		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
+		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams, models.ApiKey{})
 		_, _ = io.WriteString(w, "{\"result\":\"OK\"}")
 		return
 	}
-	doBlockingPartCompleteChunk(w, request.Uuid, request.FileHeader, user, uploadParams)
+	doBlockingPartCompleteChunk(w, request.Uuid, request.FileHeader, user, uploadParams, models.ApiKey{})
 }
 
-func doBlockingPartCompleteChunk(w http.ResponseWriter, uuid string, fileHeader chunking.FileHeader, user models.User, uploadParameters models.UploadParameters) {
+func doBlockingPartCompleteChunk(w http.ResponseWriter, uuid string, fileHeader chunking.FileHeader, user models.User, uploadParameters models.UploadParameters, apikey models.ApiKey) {
+	if uploadParameters.FileRequestId != "" {
+		completeFileRequestChunk(w, uuid, fileHeader, user, uploadParameters, apikey)
+		return
+	}
 	file, err := fileupload.CompleteChunk(uuid, fileHeader, user.Id, uploadParameters)
 	if err != nil {
 		_ = chunking.DeleteChunk(uuid)
 		sendError(w, http.StatusBadRequest, errorcodes.UnspecifiedError, err.Error())
 		return
 	}
-	if uploadParameters.FileRequestId != "" {
-		chunkreservation.SetComplete(uploadParameters.FileRequestId, uuid)
-	}
 	fr, _ := filerequest.Get(uploadParameters.FileRequestId)
 	logging.LogUpload(file, user, fr)
 	outputFileJson(w, file)
+}
+
+// completeFileRequestChunk finishes a chunk upload that belongs to a file request.
+// It advances only the reservation that was claimed by the caller and converts the slot
+// to "used" exactly once after the file metadata was confirmed. If the storage or database
+// response is uncertain, it reconciles against the file metadata and the chunk and only
+// resumes missing stages, so a retry never creates a second file.
+func completeFileRequestChunk(w http.ResponseWriter, uuid string, fileHeader chunking.FileHeader, user models.User, uploadParameters models.UploadParameters, apikey models.ApiKey) {
+	file, err := fileupload.CompleteChunk(uuid, fileHeader, user.Id, uploadParameters)
+	if err == nil {
+		markReservationCompleted(uuid, uploadParameters)
+		fr, _ := filerequest.Get(uploadParameters.FileRequestId)
+		logging.LogUpload(file, user, fr)
+		outputFileJson(w, file)
+		return
+	}
+	// The operation failed, but the response may have been uncertain: check whether the
+	// file metadata was still committed, and report the existing file instead of failing.
+	if confirmedFile, metadataConfirmed := database.GetMetaDataById(uploadParameters.PreassignedFileId); metadataConfirmed {
+		markReservationCompleted(uuid, uploadParameters)
+		fr, _ := filerequest.Get(uploadParameters.FileRequestId)
+		logging.LogUpload(confirmedFile, user, fr)
+		outputFileJson(w, confirmedFile)
+		return
+	}
+	// The operation failed, but the response may be uncertain. If the chunk is gone
+	// because the object was already stored, finish only the missing metadata stage.
+	if !chunking.FileExists(uuid) {
+		if reservation, ok := chunkreservation.Get(uuid); ok {
+			if recoveredFile, recovered := storage.RecoverFileUpload(reservation, user.Id, uploadParameters); recovered {
+				markReservationCompleted(uuid, uploadParameters)
+				fr, _ := filerequest.Get(uploadParameters.FileRequestId)
+				logging.LogUpload(recoveredFile, user, fr)
+				outputFileJson(w, recoveredFile)
+				return
+			}
+		}
+		// Neither object could be confirmed nor is the chunk left: validation failure,
+		// release the slot explicitly.
+		chunkreservation.Cancel(uploadParameters.FileRequestId, uuid, apikey.Id, false)
+	} else {
+		// The chunk is still present, so the object stage was not confirmed: reopen the
+		// reservation for an immediate retry that reuses the same preassigned file id.
+		chunkreservation.ResumeForRetry(uuid)
+	}
+	sendError(w, http.StatusBadRequest, errorcodes.UnspecifiedError, err.Error())
+}
+
+// markReservationCompleted converts the slot to "used" exactly once
+func markReservationCompleted(uuid string, uploadParameters models.UploadParameters) {
+	chunkreservation.MarkCompleted(models.UploadReservation{
+		Uuid:          uuid,
+		FileRequestId: uploadParameters.FileRequestId,
+		FileId:        uploadParameters.PreassignedFileId,
+	})
 }
 
 func apiChunkUploadRequestComplete(w http.ResponseWriter, r requestParser, user models.User, apikey models.ApiKey) {
@@ -521,7 +606,9 @@ func apiChunkUploadRequestComplete(w http.ResponseWriter, r requestParser, user 
 	if !ok {
 		panic("invalid parameter passed")
 	}
-	fileRequest, ok, status, errorCode, errorMsg := checkFileRequestAndApiKey(request.FileRequestId, apikey)
+	// Completion must not be rejected just because the file limit is now reached: a
+	// retry of an already claimed or completed upload must remain idempotent.
+	fileRequest, ok, status, errorCode, errorMsg := checkFileRequestForCompletion(request.FileRequestId, apikey)
 	if !ok {
 		sendError(w, status, errorCode, errorMsg)
 		return
@@ -529,12 +616,49 @@ func apiChunkUploadRequestComplete(w http.ResponseWriter, r requestParser, user 
 	uploadParams := fileupload.CreateUploadConfig(0,
 		0, "", true, true,
 		false, request.FileSize, fileRequest.Id)
+
+	// Idempotent fast path for already completed reservations, regardless of the
+	// remaining file count
+	if reservation, exists := chunkreservation.Get(request.Uuid); exists &&
+		reservation.Status == models.ReservationStatusCompleted {
+		if file, fileOk := database.GetMetaDataById(reservation.FileId); fileOk {
+			outputFileJson(w, file)
+			return
+		}
+	}
+
+	// A new completion cannot start once the request reached its file limit
+	if !fileRequest.IsUnlimitedFiles() && fileRequest.UploadedFiles >= fileRequest.MaxFiles {
+		sendError(w, http.StatusUnauthorized, errorcodes.CannotUploadMoreFiles,
+			"Max file count has already been reached for this file request")
+		return
+	}
+
+	// Atomically claim the reservation for this completion and obtain the preassigned file
+	// id that keeps the completion idempotent.
+	reservation, err := chunkreservation.Claim(fileRequest.Id, request.Uuid, apikey.Id, request.FileHeader)
+	if err != nil {
+		if errors.Is(err, chunkreservation.ErrAlreadyCompleted) {
+			if file, fileOk := database.GetMetaDataById(reservation.FileId); fileOk {
+				outputFileJson(w, file)
+				return
+			}
+		}
+		if errors.Is(err, chunkreservation.ErrAlreadyProcessing) {
+			sendError(w, http.StatusConflict, errorcodes.InvalidChunkReservation, err.Error())
+			return
+		}
+		sendError(w, http.StatusBadRequest, errorcodes.InvalidChunkReservation, err.Error())
+		return
+	}
+	uploadParams.PreassignedFileId = reservation.FileId
+
 	if request.IsNonBlocking {
-		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
+		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams, apikey)
 		_, _ = io.WriteString(w, "{\"result\":\"OK\"}")
 		return
 	}
-	doBlockingPartCompleteChunk(w, request.Uuid, request.FileHeader, user, uploadParams)
+	doBlockingPartCompleteChunk(w, request.Uuid, request.FileHeader, user, uploadParams, apikey)
 }
 
 func apiVersionInfo(w http.ResponseWriter, _ requestParser, _ models.User, _ models.ApiKey) {
@@ -1197,6 +1321,9 @@ func apiURequestSave(w http.ResponseWriter, r requestParser, user models.User, _
 			sendError(w, http.StatusUnauthorized, errorcodes.NoPermission, "No permission to edit this upload request")
 			return
 		}
+		// Invalidate reservations created against the previous generation, so edits or
+		// key rotation cannot be bypassed by in-flight uploads
+		uploadRequest.BumpVersion()
 	} else {
 		uploadRequest = filerequest.New(user)
 		apiKey := generateNewKey(false, user.Id, "File Request Public Access", uploadRequest.Id)

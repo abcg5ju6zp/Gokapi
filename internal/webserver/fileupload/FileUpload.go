@@ -1,7 +1,6 @@
 package fileupload
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -64,8 +63,10 @@ func isChunkMinChunkSize(r *http.Request, offset, fileSize int64) bool {
 	return false
 }
 
-// ProcessNewChunk processes a file chunk upload request
-func ProcessNewChunk(w http.ResponseWriter, r *http.Request, isApiCall bool, filerequestId string, maxFileSize int64) (int, error) {
+// ProcessNewChunk processes a file chunk upload request.
+// For file request uploads, filerequestId and filerequestApiKey identify the persistent
+// reservation that the chunk advances. Both are empty for regular logged-in uploads.
+func ProcessNewChunk(w http.ResponseWriter, r *http.Request, isApiCall bool, filerequestId, filerequestApiKey string, maxFileSize int64) (int, error) {
 	err := r.ParseMultipartForm(int64(configuration.Get().MaxMemory) * 1024 * 1024)
 	if err != nil {
 		return errorcodes.CannotParse, err
@@ -80,17 +81,23 @@ func ProcessNewChunk(w http.ResponseWriter, r *http.Request, isApiCall bool, fil
 		return errorcodes.InvalidUserInput, err
 	}
 
+	if filerequestId != "" {
+		reservation, err := chunkreservation.MarkUploading(filerequestId, chunkInfo.UUID, filerequestApiKey)
+		if err != nil {
+			return errorcodes.InvalidChunkReservation, err
+		}
+		// Use the size limit snapshot bound to the reservation, so a later edit of the
+		// request cannot change the limit for this generation
+		if reservation.MaxSizeBytes > 0 && maxFileSize > reservation.MaxSizeBytes {
+			maxFileSize = reservation.MaxSizeBytes
+		}
+	}
+
 	if !isChunkMinChunkSize(r, chunkInfo.Offset, chunkInfo.TotalFilesizeBytes) {
 		return errorcodes.ChunkTooSmall, storage.ErrorChunkTooSmall
 	}
 	if chunkInfo.TotalFilesizeBytes > maxFileSize || chunkInfo.Offset > maxFileSize {
 		return errorcodes.FileTooLarge, storage.ErrorFileTooLarge
-	}
-
-	if filerequestId != "" {
-		if !chunkreservation.SetUploading(filerequestId, chunkInfo.UUID) {
-			return errorcodes.InvalidChunkReservation, errors.New("chunk reservation has expired or was not requested")
-		}
 	}
 
 	err = chunking.NewChunk(file, header, chunkInfo, maxFileSize)
