@@ -84,7 +84,12 @@ func GetDefaultBucketName() string {
 	return ""
 }
 
-// Stream downloads a file from AWS sequentially, used for saving to a Zip file
+// GetObjectReader opens a sequential reader for an object in S3
+func GetObjectReader(file models.File) (io.ReadCloser, error) {
+	return nil, errors.New(errorString)
+}
+
+// Stream downloads a file from AWS sequentially, used to saving to a Zip file
 func Stream(writer io.Writer, file models.File) error {
 	return errors.New(errorString)
 }

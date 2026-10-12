@@ -358,6 +358,43 @@ func DeleteFileRequest(request models.FileRequest) {
 	db.DeleteFileRequest(request)
 }
 
+// Presigned Download Credentials
+
+// GetPresign returns the presigned download credential with the given ID
+func GetPresign(id string) (models.Presign, bool) {
+	return db.GetPresign(id)
+}
+
+// GetAllPresigns returns all persisted presigned download credentials
+func GetAllPresigns() []models.Presign {
+	return db.GetAllPresigns()
+}
+
+// SavePresign stores a presigned download credential
+func SavePresign(presign models.Presign) {
+	db.SavePresign(presign)
+}
+
+// DeletePresign deletes a presigned download credential with the given ID
+func DeletePresign(id string) {
+	db.DeletePresign(id)
+}
+
+// ClaimPresign atomically claims an available, unexpired credential
+func ClaimPresign(id string, now int64, token string) (models.Presign, bool) {
+	return db.ClaimPresign(id, now, token)
+}
+
+// ReleasePresign atomically returns a claimed credential to the available state
+func ReleasePresign(id string, token string) bool {
+	return db.ReleasePresign(id, token)
+}
+
+// SetPresignDelivered atomically marks a claimed credential as delivered
+func SetPresignDelivered(id string, token string) bool {
+	return db.SetPresignDelivered(id, token)
+}
+
 // Statistics
 
 // GetStatTraffic returns the total traffic from statistics

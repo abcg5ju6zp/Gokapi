@@ -627,10 +627,17 @@ func apiDownloadSingle(w http.ResponseWriter, r requestParser, user models.User,
 	}
 	if !request.PresignUrl {
 		forceDecryption := file.Encryption.IsEncrypted && !file.Encryption.IsEndToEndEncrypted
-		storage.ServeFile(file, w, request.WebRequest, true, request.IncreaseCounter, forceDecryption, false)
+		validFile, err := storage.ServeFile(file, w, request.WebRequest, true, request.IncreaseCounter, forceDecryption, false)
+		if err != nil {
+			_, _ = w.Write([]byte(storage.PreCommitErrorMessage(err)))
+			return
+		}
+		if !validFile {
+			sendError(w, http.StatusNotFound, errorcodes.NotFound, "File not found")
+		}
 		return
 	}
-	createAndOutputPresignedUrl([]string{file.Id}, w, "")
+	createAndOutputPresignedUrl([]models.File{file}, user, w, "")
 }
 
 func apiDownloadZip(w http.ResponseWriter, r requestParser, user models.User, _ models.ApiKey) {
@@ -639,7 +646,6 @@ func apiDownloadZip(w http.ResponseWriter, r requestParser, user models.User, _ 
 		panic("invalid parameter passed")
 	}
 	requestedFiles := make([]models.File, 0)
-	requestedFileIds := make([]string, 0)
 	for _, fileId := range request.Ids {
 		file, statusCode, errCode, errMessage := checkDownloadAllowed(fileId, user)
 		if statusCode != 0 {
@@ -648,13 +654,15 @@ func apiDownloadZip(w http.ResponseWriter, r requestParser, user models.User, _ 
 			return
 		}
 		requestedFiles = append(requestedFiles, file)
-		requestedFileIds = append(requestedFileIds, file.Id)
 	}
 	if !request.PresignUrl {
-		storage.ServeFilesAsZip(requestedFiles, request.Filename, w, request.WebRequest)
+		committed := storage.ServeFilesAsZip(requestedFiles, request.Filename, w, request.WebRequest)
+		if !committed {
+			_, _ = w.Write([]byte("Error getting file handler"))
+		}
 		return
 	}
-	createAndOutputPresignedUrl(requestedFileIds, w, request.Filename)
+	createAndOutputPresignedUrl(requestedFiles, user, w, request.Filename)
 }
 
 func checkDownloadAllowed(fileId string, user models.User) (models.File, int, int, string) {
@@ -668,13 +676,11 @@ func checkDownloadAllowed(fileId string, user models.User) (models.File, int, in
 	return file, 0, 0, ""
 }
 
-func createAndOutputPresignedUrl(ids []string, w http.ResponseWriter, filename string) {
-	presignUrl := models.Presign{
-		Id:       helper.GenerateRandomString(60),
-		FileIds:  ids,
-		Expiry:   time.Now().Add(time.Second * 30).Unix(),
-		Filename: filename,
-	}
+// createAndOutputPresignedUrl persists a credential bound to the authorized file
+// snapshot (file versions, owner, archive name and validity period) before the
+// URL is returned, so unused credentials survive service restarts
+func createAndOutputPresignedUrl(files []models.File, user models.User, w http.ResponseWriter, filename string) {
+	presignUrl := presign.New(files, user, filename)
 	presign.Save(presignUrl)
 	response := struct {
 		Result      string `json:"Result"`

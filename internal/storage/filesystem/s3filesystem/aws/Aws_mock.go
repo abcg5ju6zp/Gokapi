@@ -201,20 +201,25 @@ func GetDefaultBucketName() string {
 	return bucketName
 }
 
+// GetObjectReader opens a sequential reader for an object in S3. The caller is
+// responsible for closing the reader.
+func GetObjectReader(file models.File) (io.ReadCloser, error) {
+	if !isValidCredentials() {
+		return nil, errors.New("invalid credentials / invalid bucket / invalid region")
+	}
+	if !isUploaded(file) {
+		return nil, errors.New("file not found")
+	}
+	return os.Open("data/" + file.SHA1)
+}
+
 // Stream downloads a file from AWS sequentially, used for saving to a Zip file
 func Stream(writer io.Writer, file models.File) error {
-	if !isValidCredentials() {
-		return errors.New("invalid credentials / invalid bucket / invalid region")
-	}
-
-	if isUploaded(file) {
-		data, err := os.Open("data/" + file.SHA1)
-		if err != nil {
-			return err
-		}
-		defer data.Close()
-		_, err = io.Copy(writer, data)
+	data, err := GetObjectReader(file)
+	if err != nil {
 		return err
 	}
-	return errors.New("file not found")
+	defer data.Close()
+	_, err = io.Copy(writer, data)
+	return err
 }

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -575,7 +576,9 @@ func TestServeFile(t *testing.T) {
 	test.IsEqualBool(t, result, true)
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
-	ServeFile(file, w, r, true, true, false, false)
+	validServe, errServe := ServeFile(file, w, r, true, true, false, false)
+	test.IsEqualBool(t, validServe, true)
+	test.IsNil(t, errServe)
 	_, result = GetFile(idNewFile)
 	test.IsEqualBool(t, result, false)
 
@@ -596,7 +599,9 @@ func TestServeFile(t *testing.T) {
 		w = httptest.NewRecorder()
 		file, result = GetFile("awsTest1234567890123")
 		test.IsEqualBool(t, result, true)
-		ServeFile(file, w, r, false, true, false, false)
+		validServe, errServe = ServeFile(file, w, r, false, true, false, false)
+		test.IsEqualBool(t, validServe, true)
+		test.IsNil(t, errServe)
 		if aws.IsMockApi {
 			test.ResponseBodyContains(t, w, "https://redirect.url")
 		} else {
@@ -621,8 +626,12 @@ func TestServeFile(t *testing.T) {
 	file.Encryption.Nonce = nonce
 	r = httptest.NewRequest("GET", "/", nil)
 	w = httptest.NewRecorder()
-	ServeFile(file, w, r, true, true, false, false)
-	test.ResponseBodyContains(t, w, "Error decrypting file")
+	validServe, errServe = ServeFile(file, w, r, true, true, false, false)
+	test.IsEqualBool(t, validServe, true)
+	test.IsNotNil(t, errServe)
+	test.IsEqualBool(t, errors.Is(errServe, ErrorInvalidDecryption), true)
+	// Nothing must have been written before the failed commit
+	test.ResponseBodyContains(t, w, "")
 }
 
 func TestCleanUp(t *testing.T) {
@@ -928,7 +937,7 @@ func TestParallelDownloads(t *testing.T) {
 				r := httptest.NewRequest("GET", "/"+singleDownloadFile.Id, nil)
 
 				// The mutex inside ServeFile should serialize the decrement logic.
-				success := ServeFile(singleDownloadFile, w, r, false, true, false, true)
+				success, _ := ServeFile(singleDownloadFile, w, r, false, true, false, true)
 				results <- success
 			}()
 		}

@@ -31,6 +31,7 @@ import (
 	"github.com/forceu/gokapi/internal/storage/chunking"
 	"github.com/forceu/gokapi/internal/storage/filesystem"
 	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
+	"github.com/forceu/gokapi/internal/storage/presign"
 	"github.com/forceu/gokapi/internal/storage/processingstatus"
 	"github.com/forceu/gokapi/internal/webserver/api/mutex/apimutex"
 	"github.com/forceu/gokapi/internal/webserver/downloadstatus"
@@ -53,6 +54,23 @@ var ErrorFileNotFound = errors.New("file not found")
 
 // ErrorInvalidPresign is raised when an invalid presign key has been passed or it has expired
 var ErrorInvalidPresign = errors.New("invalid presign")
+
+// ErrorGettingFileHandler is raised when the local source file cannot be opened before the
+// response has been committed
+var ErrorGettingFileHandler = errors.New("error getting file handler")
+
+// ErrorInvalidDecryption is raised when the stored decryption key does not match the file,
+// detected before the response has been committed
+var ErrorInvalidDecryption = errors.New("internal error - error decrypting file, source data might be damaged or an incorrect key has been used")
+
+// PreCommitErrorMessage maps a pre-commit error from ServeFile to the legacy plain-text
+// response body used by non-presigned download paths
+func PreCommitErrorMessage(err error) string {
+	if errors.Is(err, ErrorInvalidDecryption) {
+		return "Internal error - Error decrypting file, source data might be damaged or an incorrect key has been used"
+	}
+	return "Error getting file handler"
+}
 
 // NewFile creates a new file in the system. Called after an upload from the API has been completed. If a file with the same sha1 hash
 // already exists, it is deduplicated. This function gathers information about the file, creates an ID and saves
@@ -618,9 +636,14 @@ func GetFileByHotlink(id string) (models.File, bool) {
 	return GetFile(fileId)
 }
 
-// ServeFile subtracts a download allowance and serves the file to the browser
-// Returns false if the file expired during the request (most likely race condition due to parallel downloads, requires recheckExpiry)
-func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDownload, increaseCounter, forceDecryption, recheckExpiry bool) bool {
+// ServeFile subtracts a download allowance and serves the file to the browser.
+// It returns (false, nil) if the file expired during the request (most likely
+// race condition due to parallel downloads, requires recheckExpiry). It returns
+// an error if the download could not be prepared before the response was
+// committed; in that case nothing has been written to w, so the caller may
+// release a claimed presigned credential and retry. A nil error means that the
+// response body or redirect has been committed and the delivery is final.
+func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDownload, increaseCounter, forceDecryption, recheckExpiry bool) (bool, error) {
 	apimutex.Lock(apimutex.TypeMetaData, file.Id)
 	if recheckExpiry {
 		if !file.UnlimitedDownloads {
@@ -628,7 +651,7 @@ func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDo
 		}
 		if IsExpiredFile(file, time.Now().Unix()) {
 			apimutex.Unlock(apimutex.TypeMetaData, file.Id)
-			return false
+			return false, nil
 		}
 	}
 	if increaseCounter {
@@ -647,24 +670,28 @@ func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDo
 		// confirm that the file has been completely downloaded. It expires automatically after 24 hours.
 		statusId := downloadstatus.SetDownload(file)
 		isBlocking, err := aws.ServeFile(w, r, file, forceDownload, forceDecryption)
-		// TODO chances are high that an error is returned here, we should consider proper output
-		helper.Check(err)
+		if err != nil {
+			// The S3 link generation failed or the object could not be opened before any header
+			// or redirect was committed: report the failure so that a claimed presigned credential
+			// can be released for retry.
+			fmt.Println(err)
+			downloadstatus.SetComplete(statusId)
+			return true, err
+		}
 		if isBlocking {
 			downloadstatus.SetComplete(statusId)
 		}
-		return true
+		return true, nil
 	}
 	fileHandler, _, err := getFileHandler(file, configuration.Get().DataDir)
-	defer fileHandler.Close()
 	if err != nil {
 		fmt.Println(err)
-		_, _ = w.Write([]byte("Error getting file handler"))
-		return true
+		return true, ErrorGettingFileHandler
 	}
+	defer fileHandler.Close()
 	if file.Encryption.IsEncrypted && !file.RequiresClientDecryption() {
 		if !encryption.IsCorrectKey(file.Encryption, fileHandler) {
-			_, _ = w.Write([]byte("Internal error - Error decrypting file, source data might be damaged or an incorrect key has been used"))
-			return true
+			return true, ErrorInvalidDecryption
 		}
 	}
 	statusId := downloadstatus.SetDownload(file)
@@ -672,15 +699,14 @@ func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDo
 	if file.Encryption.IsEncrypted && !file.RequiresClientDecryption() {
 		err = encryption.DecryptReader(file.Encryption, fileHandler, w)
 		if err != nil {
-			_, _ = w.Write([]byte("Error decrypting file"))
 			fmt.Println(err)
-			return true
+			return true, nil
 		}
 	} else {
 		http.ServeContent(w, r, file.Name, time.Now(), fileHandler)
 	}
 	downloadstatus.SetComplete(statusId)
-	return true
+	return true, nil
 }
 
 // Returns the filename if unique or a new filename in the format "Name (x).ext"
@@ -704,74 +730,99 @@ func makeFilenameUnique(filename string, nameMap *map[string]bool) string {
 }
 
 // ServeFilesAsZip will zip all files and serve them to the browser. Can decrypt files if not end-to-end encrypted.
-func ServeFilesAsZip(files []models.File, filename string, w http.ResponseWriter, r *http.Request) {
+// It returns true once the response has been committed (zip stream started or an empty zip written).
+// If it returns false, no response bytes have been written yet and the caller may release a claimed
+// presigned credential so that the same snapshot can be retried.
+func ServeFilesAsZip(files []models.File, filename string, w http.ResponseWriter, r *http.Request) bool {
 	if filename == "" {
 		filename = "Gokapi"
 	}
 	filename = helper.SanitiseFilename(filename)
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", filename))
-	w.WriteHeader(http.StatusOK)
 
 	saveIp := configuration.Get().SaveIp
 	zipWriter := zip.NewWriter(w)
-	defer zipWriter.Close()
 	filenames := make(map[string]bool)
-	for _, file := range files {
+	for i, file := range files {
 		file.Name = makeFilenameUnique(file.Name, &filenames)
+
+		// Open the source before the zip entry header is written. For the first file this happens
+		// before any response byte is committed, so a failure (missing local file, wrong decryption
+		// key, unavailable S3 object) leaves the response retryable.
+		var source io.ReadCloser
+		var statusId string
+		var err error
+		if !file.IsLocalStorage() {
+			source, err = aws.GetObjectReader(file)
+			if err == nil {
+				statusId = downloadstatus.SetDownload(file)
+			}
+		} else {
+			var fileHandler *os.File
+			fileHandler, _, err = getFileHandler(file, configuration.Get().DataDir)
+			if err == nil {
+				source = fileHandler
+				if file.Encryption.IsEncrypted && !encryption.IsCorrectKey(file.Encryption, fileHandler) {
+					_ = source.Close()
+					source = nil
+					err = ErrorInvalidDecryption
+				}
+			}
+		}
+		if err != nil {
+			fmt.Println(err)
+			if i == 0 {
+				// Nothing has been written: the caller can release the claim and retry.
+				return false
+			}
+			_, _ = w.Write([]byte("Error getting file handler"))
+			_ = zipWriter.Close()
+			return true
+		}
+
+		// CreateHeader writes the local file header through w for the first entry, which commits
+		// the HTTP response and makes the delivery final.
 		header := &zip.FileHeader{
 			Name:     file.Name,
 			Method:   zip.Store,
 			Modified: time.Unix(file.UploadDate, 0),
 		}
 		entryWriter, err := zipWriter.CreateHeader(header)
-		helper.Check(err)
-		logging.LogDownload(file, r, saveIp)
-		go serverstats.AddTraffic(uint64(file.SizeBytes))
-		if !file.IsLocalStorage() {
-			statusId := downloadstatus.SetDownload(file)
-			err = aws.Stream(entryWriter, file)
-			helper.Check(err)
-			downloadstatus.SetComplete(statusId)
-			_ = zipWriter.Flush()
-			flushingWriter, ok := w.(http.Flusher)
-			if ok {
-				flushingWriter.Flush()
-			}
-			continue
-		}
-		fileHandler, _, err := getFileHandler(file, configuration.Get().DataDir)
 		if err != nil {
 			fmt.Println(err)
-			_, _ = w.Write([]byte("Error getting file handler"))
-			return
+			_ = source.Close()
+			_ = zipWriter.Close()
+			return i != 0
 		}
-		statusId := downloadstatus.SetDownload(file)
+		logging.LogDownload(file, r, saveIp)
+		go serverstats.AddTraffic(uint64(file.SizeBytes))
+
 		if file.Encryption.IsEncrypted {
-			if !encryption.IsCorrectKey(file.Encryption, fileHandler) {
-				_, _ = w.Write([]byte("Internal error - Error decrypting file, source data might be damaged or an incorrect key has been used"))
-				_ = fileHandler.Close()
-				return
-			}
-			err = encryption.DecryptReader(file.Encryption, fileHandler, entryWriter)
-			if err != nil {
-				_, _ = w.Write([]byte("Error decrypting file"))
-				fmt.Println(err)
-				_ = fileHandler.Close()
-				return
-			}
+			err = encryption.DecryptReader(file.Encryption, source, entryWriter)
 		} else {
-			_, err = io.Copy(entryWriter, fileHandler)
-			helper.Check(err)
-			_ = fileHandler.Close()
+			_, err = io.Copy(entryWriter, source)
 		}
-		downloadstatus.SetComplete(statusId)
+		_ = source.Close()
+		if err != nil {
+			fmt.Println(err)
+			_, _ = w.Write([]byte("Error decrypting file"))
+			if statusId != "" {
+				downloadstatus.SetComplete(statusId)
+			}
+			_ = zipWriter.Close()
+			return true
+		}
+		if statusId != "" {
+			downloadstatus.SetComplete(statusId)
+		}
 		_ = zipWriter.Flush()
-		flushingWriter, ok := w.(http.Flusher)
-		if ok {
+		if flushingWriter, ok := w.(http.Flusher); ok {
 			flushingWriter.Flush()
 		}
 	}
+	_ = zipWriter.Close()
+	return true
 }
 
 func getFileHandler(file models.File, dataDir string) (*os.File, int64, error) {
@@ -812,6 +863,7 @@ func FileExists(file models.File, dataDir string) bool {
 // If the parameter periodic is true, this function is recursive and calls itself every hour.
 func CleanUp(periodic bool) {
 	downloadstatus.Clean()
+	presign.RecoverAndClean()
 	timeNow := time.Now().Unix()
 	wasItemDeleted := false
 	for key, element := range database.GetAllMetadata() {

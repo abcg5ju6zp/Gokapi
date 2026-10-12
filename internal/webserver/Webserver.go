@@ -637,7 +637,11 @@ func showHotlink(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(imageExpiredPicture)
 		return
 	}
-	validFile := storage.ServeFile(file, w, r, false, true, false, true)
+	validFile, err := storage.ServeFile(file, w, r, false, true, false, true)
+	if err != nil {
+		_, _ = w.Write([]byte(storage.PreCommitErrorMessage(err)))
+		return
+	}
 	if !validFile {
 		// Only called if the file has already expired during the expiry check of storage.ServeFile()
 		w.Header().Set("Content-Type", "image/svg+xml")
@@ -1036,37 +1040,146 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // Handling of /downloadPresigned
-// Outputs the file to the user and reduces the download remaining count for the file, if requested
+// Outputs the file to the user. The credential is claimed atomically and only
+// finalized once the response body or remote redirect has actually been
+// committed; pre-commit failures release it for retry.
 func downloadPresigned(w http.ResponseWriter, r *http.Request) {
 	addNoCacheHeader(w)
 	presignKey, ok := r.URL.Query()["key"]
+	if !ok || len(presignKey[0]) == 0 {
+		responseError(w, storage.ErrorInvalidPresign)
+		return
+	}
+	credential, ok := presign.TryClaim(presignKey[0])
 	if !ok {
 		responseError(w, storage.ErrorInvalidPresign)
 		return
 	}
-	presignedUrl, ok := presign.Get(presignKey[0])
-	if !ok {
-		responseError(w, storage.ErrorInvalidPresign)
+
+	files, err := getFilesForPresign(credential)
+	if err != nil {
+		// The snapshot no longer matches the authorized content (file expired,
+		// pending deletion, replaced, re-owned or missing). Burn the credential
+		// so that an old link can never read new content.
+		presign.MarkDelivered(credential)
+		responseError(w, err)
 		return
 	}
-	files := make([]models.File, 0)
-	for _, file := range presignedUrl.FileIds {
-		storedFile, ok := storage.GetFile(file)
-		if !ok {
-			responseError(w, storage.ErrorFileNotFound)
-			return
-		}
-		files = append(files, storedFile)
-	}
-	presign.Delete(presignedUrl.Id)
+
+	tracker := newPresignCommitTracker(w, func() bool {
+		return presign.MarkDelivered(credential)
+	})
 
 	if len(files) == 1 {
 		file := files[0]
 		forceDecryption := file.Encryption.IsEncrypted && !file.Encryption.IsEndToEndEncrypted
-		storage.ServeFile(file, w, r, true, false, forceDecryption, false)
+		validFile, serveErr := storage.ServeFile(file, tracker, r, true, false, forceDecryption, false)
+		if tracker.committed {
+			return
+		}
+		// Nothing was committed: release the claim for retry with the same snapshot.
+		presign.Release(credential)
+		if serveErr != nil {
+			fmt.Println(serveErr)
+		}
+		if !validFile {
+			responseError(w, storage.ErrorFileNotFound)
+		} else {
+			responseError(w, storage.ErrorInvalidPresign)
+		}
 		return
 	}
-	storage.ServeFilesAsZip(files, presignedUrl.Filename, w, r)
+	committed := storage.ServeFilesAsZip(files, credential.Filename, tracker, r)
+	if !committed {
+		// ZIP generation failed before any response byte was sent: retryable.
+		presign.Release(credential)
+		responseError(w, storage.ErrorInvalidPresign)
+	}
+}
+
+// getFilesForPresign revalidates the immutable authorization snapshot bound to
+// the credential at claim time: every file must still exist with the same
+// content version (SHA1) and owner, and must not be expired or pending
+// deletion. It returns the current files in the original snapshot order.
+func getFilesForPresign(credential models.Presign) ([]models.File, error) {
+	if len(credential.Files) == 0 {
+		return nil, storage.ErrorInvalidPresign
+	}
+	files := make([]models.File, 0, len(credential.Files))
+	for _, snapshotFile := range credential.Files {
+		// Raw metadata lookup, so that a replaced or re-owned file is detected
+		// instead of silently serving the new content.
+		current, ok := database.GetMetaDataById(snapshotFile.Id)
+		if !ok {
+			return nil, storage.ErrorFileNotFound
+		}
+		if current.SHA1 != snapshotFile.SHA1 || current.UserId != snapshotFile.UserId {
+			return nil, storage.ErrorInvalidPresign
+		}
+		// Applies the standard validity checks: expiry, download allowance,
+		// pending deletion and existence on local or remote storage.
+		file, ok := storage.GetFile(snapshotFile.Id)
+		if !ok {
+			return nil, storage.ErrorFileNotFound
+		}
+		files = append(files, file)
+	}
+	return files, nil
+}
+
+// presignCommitTracker wraps the response writer of a presigned download. Its
+// first WriteHeader or Write marks the credential as delivered before the
+// header or body is passed through, establishing the non-repeatable terminal
+// state exactly at the delivery checkpoint.
+type presignCommitTracker struct {
+	http.ResponseWriter
+	committed bool
+	fenced    bool
+	mark      func() bool
+}
+
+func newPresignCommitTracker(w http.ResponseWriter, mark func() bool) *presignCommitTracker {
+	return &presignCommitTracker{ResponseWriter: w, mark: mark}
+}
+
+// commit records the terminal state before the first response byte leaves. If
+// the claim generation has lost ownership (e.g. timeout recovery moved the
+// credential along), the writer is fenced so no second consumer can deliver.
+func (w *presignCommitTracker) commit() {
+	if w.committed {
+		return
+	}
+	w.committed = true
+	if !w.mark() {
+		w.fenced = true
+	}
+}
+
+func (w *presignCommitTracker) WriteHeader(statusCode int) {
+	if !w.committed {
+		w.commit()
+	}
+	if w.fenced {
+		return
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *presignCommitTracker) Write(data []byte) (int, error) {
+	if !w.committed {
+		w.commit()
+	}
+	if w.fenced {
+		return 0, errors.New("presign claim is no longer owned by this generation")
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+// Flush implements http.Flusher, required for streaming ZIP downloads
+func (w *presignCommitTracker) Flush() {
+	if flushingWriter, ok := w.ResponseWriter.(http.Flusher); ok {
+		flushingWriter.Flush()
+	}
 }
 
 func serveFile(id string, isRootUrl bool, w http.ResponseWriter, r *http.Request) {
@@ -1091,7 +1204,11 @@ func serveFile(id string, isRootUrl bool, w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	validFile := storage.ServeFile(savedFile, w, r, true, true, false, true)
+	validFile, err := storage.ServeFile(savedFile, w, r, true, true, false, true)
+	if err != nil {
+		_, _ = w.Write([]byte(storage.PreCommitErrorMessage(err)))
+		return
+	}
 	if !validFile {
 		// Only called if the file has already expired during the expiry check of storage.ServeFile()
 		if isRootUrl {

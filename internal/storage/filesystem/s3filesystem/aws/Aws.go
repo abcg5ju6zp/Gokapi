@@ -122,8 +122,10 @@ func download(writer io.WriterAt, file models.File) (int64, error) {
 	return size, nil
 }
 
-// Stream downloads a file from AWS sequentially, used for saving to a Zip file
-func Stream(writer io.Writer, file models.File) error {
+// GetObjectReader opens a sequential reader for an object in S3. No response
+// bytes have been committed when it returns, allowing callers to fail before
+// the HTTP response is sent. The caller is responsible for closing the reader.
+func GetObjectReader(file models.File) (io.ReadCloser, error) {
 	sess := createSession()
 	s3svc := s3.New(sess)
 
@@ -132,16 +134,23 @@ func Stream(writer io.Writer, file models.File) error {
 		Key:    aws.String(file.SHA1),
 	})
 	if err != nil {
+		return nil, err
+	}
+	return obj.Body, nil
+}
+
+// Stream downloads a file from AWS sequentially, used for saving to a Zip file
+func Stream(writer io.Writer, file models.File) error {
+	body, err := GetObjectReader(file)
+	if err != nil {
 		return err
 	}
-	defer obj.Body.Close()
-
-	var reader io.Reader = obj.Body
+	defer body.Close()
 
 	if file.Encryption.IsEncrypted {
-		return encryption.DecryptReader(file.Encryption, obj.Body, writer)
+		return encryption.DecryptReader(file.Encryption, body, writer)
 	}
-	_, err = io.Copy(writer, reader)
+	_, err = io.Copy(writer, body)
 	return err
 }
 

@@ -109,6 +109,27 @@ type Database interface {
 	// DeleteFileRequest deletes a file request with the given ID
 	DeleteFileRequest(request models.FileRequest)
 
+	// GetPresign returns the presigned download credential with the given ID
+	GetPresign(id string) (models.Presign, bool)
+	// GetAllPresigns returns all persisted presigned download credentials
+	GetAllPresigns() []models.Presign
+	// SavePresign stores a presigned download credential
+	SavePresign(presign models.Presign)
+	// DeletePresign deletes a presigned download credential with the given ID
+	DeletePresign(id string)
+	// ClaimPresign atomically transitions an available, unexpired credential to
+	// the claimed state, binding it to the passed claim token. Returns the
+	// claimed credential and true only for the single winning consumer.
+	ClaimPresign(id string, now int64, token string) (models.Presign, bool)
+	// ReleasePresign atomically returns a credential claimed with the passed
+	// token back to the available state. Returns false if the generation no
+	// longer owns the claim.
+	ReleasePresign(id string, token string) bool
+	// SetPresignDelivered atomically transitions a credential claimed with the
+	// passed token to the terminal delivered state. Returns false if another
+	// generation owns or has already finalized the credential.
+	SetPresignDelivered(id string, token string) bool
+
 	// GetStatTraffic returns the total traffic from statistics
 	GetStatTraffic() uint64
 	// SaveStatTraffic stores the total traffic
