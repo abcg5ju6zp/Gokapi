@@ -9,6 +9,7 @@ import (
 
 	"github.com/forceu/gokapi/internal/configuration/database/dbabstraction"
 	"github.com/forceu/gokapi/internal/configuration/database/dbcache"
+	"github.com/forceu/gokapi/internal/configuration/database/dbmigrate"
 	"github.com/forceu/gokapi/internal/helper"
 	"github.com/forceu/gokapi/internal/models"
 )
@@ -65,35 +66,12 @@ func ParseUrl(dbUrl string, mustExist bool) (models.DbConnection, error) {
 	return result, nil
 }
 
-// Migrate copies a database to a new location
-func Migrate(configOld, configNew models.DbConnection) {
-	dbOld, err := dbabstraction.GetNew(configOld)
-	helper.Check(err)
-	dbNew, err := dbabstraction.GetNew(configNew)
-	helper.Check(err)
-
-	apiKeys := dbOld.GetAllApiKeys()
-	for _, apiKey := range apiKeys {
-		dbNew.SaveApiKey(apiKey)
-	}
-	users := dbOld.GetAllUsers()
-	for _, user := range users {
-		dbNew.SaveUser(user, false)
-		dbNew.SaveEnd2EndInfo(dbOld.GetEnd2EndInfo(user.Id), user.Id)
-	}
-	files := dbOld.GetAllMetadata()
-	for _, file := range files {
-		dbNew.SaveMetaData(file)
-		if file.HotlinkId != "" {
-			dbNew.SaveHotlink(file)
-		}
-	}
-	requests := dbOld.GetAllFileRequests()
-	for _, request := range requests {
-		dbNew.SaveFileRequest(request)
-	}
-	dbOld.Close()
-	dbNew.Close()
+// Migrate copies a database to a new location using a resumable,
+// generation-isolated and integrity-checked migration. It returns an error if
+// the migration could not be completed; the source database and the last
+// usable destination generation remain unchanged in that case.
+func Migrate(configOld, configNew models.DbConnection) error {
+	return dbmigrate.Run(configOld, configNew)
 }
 
 // RunGarbageCollection runs the databases GC

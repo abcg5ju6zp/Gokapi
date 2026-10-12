@@ -23,7 +23,12 @@ func Do(flags flagparser.MigrateFlags) {
 		return
 	}
 	fmt.Printf("Migrating %s database %s to %s database %s\n", getType(oldDb.Type), oldDb.HostUrl, getType(newDb.Type), newDb.HostUrl)
-	database.Migrate(oldDb, newDb)
+	err = database.Migrate(oldDb, newDb)
+	if err != nil {
+		fmt.Println("Migration failed: " + err.Error())
+		osExit(1)
+		return
+	}
 }
 
 func getType(input int) string {
